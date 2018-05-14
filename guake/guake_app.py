@@ -114,6 +114,8 @@ GDK_WINDOW_STATE_ABOVE = 32
 
 # Transparency max level (should be always 100)
 MAX_TRANSPARENCY = 100
+# TODO: detect wayland automatically
+WAYLAND_MULTI_MONITOR_WORKAROUND = True
 
 
 class PromptQuitDialog(Gtk.MessageDialog):
@@ -156,6 +158,7 @@ class Guake(SimpleGladeApp):
     def __init__(self):
         super(Guake, self).__init__(gladefile('guake.glade'))
 
+        self.miw_callback_id = None
         self.add_callbacks(self)
 
         schema_source = Gio.SettingsSchemaSource.new_from_directory(
@@ -406,6 +409,7 @@ class Guake(SimpleGladeApp):
             )
 
         log.info("Guake initialized")
+
 
     def _patch_theme(self):
         style_provider = Gtk.CssProvider()
@@ -891,13 +895,16 @@ class Guake(SimpleGladeApp):
             return True
         return False
 
-    def show(self):
+    def show(self, monitor=None):
         """Shows the main window and grabs the focus on it.
         """
+        if not monitor and WAYLAND_MULTI_MONITOR_WORKAROUND:
+            return self.trigger_monitor_determination_workaround()
+
         self.hidden = False
 
         # setting window in all desktops
-        window_rect = self.set_final_window_rect()
+        window_rect = self.set_final_window_rect(monitor)
         self.get_widget('window-root').stick()
 
         # add tab must be called before window.show to avoid a
@@ -912,7 +919,7 @@ class Guake(SimpleGladeApp):
         self.settings.general.triggerOnChangedValue(self.settings.general, "use-scrollbar")
 
         # move the window even when in fullscreen-mode
-        log.debug("Moving window to: %r", window_rect)
+        log.debug("Moving window to: %s, %s", window_rect.x, window_rect.y)
         self.window.move(window_rect.x, window_rect.y)
 
         # this works around an issue in fluxbox
@@ -992,35 +999,101 @@ class Guake(SimpleGladeApp):
         self.get_widget('window-root').unstick()
         self.window.hide()  # Don't use hide_all here!
 
+    def monitor_identification_workaround(self, w, event):
+        """Determine which monitor to use comparing size of the maximized window
+        with and sizes of particular monitors.
+        This has to be triggered after showing the window and maximizing it.
+        """
+        self.window.disconnect(self.miw_callback_id)
+        screen = self.window.get_screen()
+        display = screen.get_display()
+        n_screens = screen.get_n_monitors()
+        width, height = self.window.get_size()
+
+        # as a fallback (if monitor matching does not work),
+        # we will use the primary monitor
+        monitor = display.get_primary_monitor()
+
+        if n_screens:
+            # while exact matching will succeed in some environments,
+            # it might be better to take the possible docks/bars into
+            # account and allow fuzzy matching
+            monitors_by_dissimilarity = {}
+
+            for n in range(n_screens):
+                monitor = display.get_monitor(n)
+                geometry = monitor.get_geometry()
+
+                # the lower, the better
+                width_mismatch = abs(geometry.width - width)
+                height_mismatch = abs(geometry.height - height)
+                score = width_mismatch + height_mismatch
+
+                monitors_by_dissimilarity[score] = monitor
+
+            best_score = min(monitors_by_dissimilarity)
+            monitor = monitors_by_dissimilarity[best_score]
+
+        self.window.set_opacity(1)
+
+        if not self.is_fullscreen:
+            self.window.unmaximize()
+            self.window.unfullscreen()
+
+        # force fast redraw
+        Gdk.flush()
+
+        self.show(monitor=monitor)
+
+    def trigger_monitor_determination_workaround(self):
+        self.window.set_opacity(0)  # just in case
+        self.window.show_all()
+        self.window.maximize()
+        self.window.fullscreen()
+        self.miw_callback_id = self.window.connect(
+            'draw',
+            self.monitor_identification_workaround
+        )
+
     def get_final_window_monitor(self):
         """Gets the final screen number for the main window of guake.
         """
 
         screen = self.window.get_screen()
+        display = screen.get_display()
 
         # fetch settings
         use_mouse = self.settings.general.get_boolean('mouse-display')
-        dest_screen = self.settings.general.get_int('display-n')
+        monitor_n = self.settings.general.get_int('display-n')
+
+        log.debug("show on mouse screen = %s", use_mouse)
+        log.debug("configured to use monitor = %s", monitor_n)
 
         if use_mouse:
-            # TODO PORT get_pointer is deprecated
-            # https://developer.gnome.org/gtk3/stable/GtkWidget.html#gtk-widget-get-pointer
             win, x, y, _ = screen.get_root_window().get_pointer()
-            dest_screen = screen.get_monitor_at_point(x, y)
+            monitor = display.get_monitor_at_point(x, y)
+            log.debug('using mouse monitor')
 
-        # If Guake is configured to use a screen that is not currently attached,
-        # default to 'primary display' option.
-        n_screens = screen.get_n_monitors()
-        if dest_screen > n_screens - 1:
-            self.settings.general.set_boolean('mouse-display', False)
-            self.settings.general.set_int('display-n', dest_screen)
-            dest_screen = screen.get_primary_monitor()
+        # use value selected by the user from monitors list
+        # and use special action for "Always on primary" choice
+        else:
 
-        # Use primary display if configured
-        if dest_screen == ALWAYS_ON_PRIMARY:
-            dest_screen = screen.get_primary_monitor()
+            # Use primary display if configured
+            if monitor_n == ALWAYS_ON_PRIMARY:
+                monitor = screen.get_primary_monitor()
+                log.debug('using primary monitor, as instructed')
 
-        return dest_screen
+            else:
+
+                monitor = display.get_monitor(monitor_n)
+
+                if monitor is None:
+                    monitor = display.get_primary_monitor()
+                    log.debug('using primary monitor, as n-th (%s) failed', monitor_n)
+                else:
+                    log.debug('using n-th (%s) monitor', monitor_n)
+
+        return monitor
 
     # TODO PORT remove this UNITY is DEAD
     def is_using_unity(self):
@@ -1037,11 +1110,20 @@ class Guake(SimpleGladeApp):
                 return True
         return False
 
-    def set_final_window_rect(self):
+    def set_final_window_rect(self, monitor=None):
         """Sets the final size and location of the main window of guake. The height
         is the window_height property, width is window_width and the
         horizontal alignment is given by window_alignment.
         """
+        if not monitor:
+            # already running a monitor identification workaround,
+            # the method was triggered by resize() callback or similar: skip it
+            if self.miw_callback_id:
+                return
+            # initialization or other legit stuff - just grab some monitor,
+            # even if it won't be as perfect as with the workaround
+            else:
+                monitor = self.get_final_window_monitor()
 
         # fetch settings
         height_percents = self.settings.general.get_int('window-height')
@@ -1062,9 +1144,8 @@ class Guake(SimpleGladeApp):
         log.debug("  hdisplacement = %s", hdisplacement)
 
         # get the rectangle just from the destination monitor
-        screen = self.window.get_screen()
-        monitor = self.get_final_window_monitor()
-        window_rect = screen.get_monitor_geometry(monitor)
+        window_rect = monitor.get_geometry()
+
         log.debug("Current monitor geometry")
         log.debug("  window_rect.x: %s", window_rect.x)
         log.debug("  window_rect.y: %s", window_rect.y)
